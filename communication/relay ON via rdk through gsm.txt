@@ -1,0 +1,187 @@
+import serial
+import time
+import os
+import subprocess
+
+# --- CONFIGURATION ---
+# Kyunki srpi-config me serial2 okay hai, isliye ttyS2 use karenge
+SERIAL_PORT = '/dev/ttyS1' 
+BAUD_RATE = 115200
+
+# FIXME: Board 1 par Board 2 ka number daalein, aur Board 2 par Board 1 ka number daalein!
+TARGET_PHONE_NUMBER = "+917972113065" 
+
+# RDK X5 GPIO Pin Configuration via 40-Pin Table (Orange XS Numbers)
+BUTTON_GPIO = "388"  # Physical Pin 11 (GPIO27)
+RELAY_GPIO = "379"   # Physical Pin 13 (GPIO22)
+
+is_sending = False 
+
+# --- GPIO SETUP & CONTROL ---
+def setup_gpio():
+    print("[*] RDK X5 GPIO Initialize kar rahe hain (Active-Low Relay Setup)...")
+    
+    # Button (Input Pin) Setup
+    if not os.path.exists(f"/sys/class/gpio/gpio{BUTTON_GPIO}"):
+        subprocess.run(f"echo {BUTTON_GPIO} > /sys/class/gpio/export", shell=True)
+    time.sleep(0.1)
+    subprocess.run(f"echo in > /sys/class/gpio/gpio{BUTTON_GPIO}/direction", shell=True)
+    
+    # Relay (Output Pin) Setup
+    if not os.path.exists(f"/sys/class/gpio/gpio{RELAY_GPIO}"):
+        subprocess.run(f"echo {RELAY_GPIO} > /sys/class/gpio/export", shell=True)
+    time.sleep(0.1)
+    subprocess.run(f"echo out > /sys/class/gpio/gpio{RELAY_GPIO}/direction", shell=True)
+    
+    # ACTIVE-LOW FIX: Starting me Relay ko Safe State (1 / OFF) par set karein
+    subprocess.run(f"echo 1 > /sys/class/gpio/gpio{RELAY_GPIO}/value", shell=True)
+    print(f"[+] Pins Ready! Button: XS {BUTTON_GPIO}, Relay: XS {RELAY_GPIO}")
+
+def read_button():
+    """Button press hone par active-low logic '0' read hota hai"""
+    try:
+        res = subprocess.check_output(f"cat /sys/class/gpio/gpio{BUTTON_GPIO}/value", shell=True)
+        return res.decode().strip() == "0"
+    except:
+        return False
+
+def control_relay(state):
+    """
+    ACTIVE-LOW LOGIC CHANGED:
+    state = True (ON chahte hain) -> Send '0' (GND)
+    state = False (OFF chahte hain) -> Send '1' (VCC)
+    """
+    val = "0" if state else "1"
+    subprocess.run(f"echo {val} > /sys/class/gpio/gpio{RELAY_GPIO}/value", shell=True)
+
+# --- GSM AT COMMAND HANDLERS ---
+def send_at_command(ser, cmd, back_response="OK", timeout=2):
+    ser.write((cmd + '\r\n').encode())
+    time.sleep(0.3)
+    response = ""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if ser.in_waiting > 0:
+            response += ser.read(ser.in_waiting).decode(errors='ignore')
+            if back_response in response:
+                return response
+    return response
+
+def initialize_gsm(ser):
+    print("[*] A7670C GSM Module configuration check...")
+    if "OK" not in send_at_command(ser, "AT"):
+        print("[!] Error: GSM Module answer nahi de raha. Connection aur Power check karein.")
+        return False
+    
+    send_at_command(ser, "ATE0")             # Local Echo OFF
+    send_at_command(ser, "AT+CMGF=1")         # SMS Text Mode ON
+    send_at_command(ser, "AT+CNMI=2,2,0,0,0") # Direct Stream Mode active
+    print("[+] GSM Module successfully configure ho gaya!")
+    return True
+
+def send_sms(ser, number, message):
+    global is_sending
+    is_sending = True 
+    print(f"\n[TX] Wireless Command bhej rahe hain target ko: {message}")
+    ser.write(f'AT+CMGS="{number}"\r\n'.encode())
+    time.sleep(0.6) 
+    
+    if ser.in_waiting > 0:
+        ser.read(ser.in_waiting) # Clear residue
+        
+    ser.write((message + chr(26)).encode()) # Send Ctrl+Z
+    time.sleep(3) 
+    
+    if ser.in_waiting > 0:
+        ser.read(ser.in_waiting) 
+    is_sending = False 
+
+def check_incoming_messages(ser):
+    global is_sending
+    if is_sending:
+        return
+
+    if ser.in_waiting > 0:
+        time.sleep(0.1) # Full line assemble hone ka chhota sa wait
+        incoming_data = ser.read(ser.in_waiting).decode(errors='ignore')
+        lines = incoming_data.split("\r\n")
+        
+        sender_number = "" # Sender ka number store karne ke liye variable
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Faltu ke logs ko filter karke hatao
+            if (not line or line == "OK" or line.startswith(">") or 
+                line.startswith("+CMGS:") or line.startswith("*ATREADY") or 
+                line.startswith("+CPIN") or line.startswith("+MSTK") or 
+                line.startswith("+CGEV") or "DONE" in line):
+                continue
+            
+            # 1. Agar SMS notification (+CMT) milti hai, toh sender ka number nikalo
+            # Example format: +CMT: "+919834739049","","26/06/02,15:30:00+22"
+            if line.startswith("+CMT:"):
+                try:
+                    # Line ko commas se split karke pehla hissa nikalte hain aur quotes hata dete hain
+                    parts = line.split(",")
+                    sender_number = parts[0].replace('+CMT:', '').replace('"', '').strip()
+                    print(f"\n[RX Alert] Message received from number: {sender_number}")
+                except Exception as e:
+                    sender_number = ""
+            
+            # 2. Agar message payload ke andar keyword 'TURN_HORN_ON' milta hai
+            elif "TURN_HORN_ON" in line:
+                # CRITICAL SECURITY CHECK: Kya yeh message sach me dusre trusted RDK board se aaya hai?
+                if TARGET_PHONE_NUMBER in sender_number or sender_number == "":
+                    print(f"🚨 TRIGGER MATCHED: Valid RDK Board ({sender_number}) se signal mila! Relay ON (10 Sec)...")
+                    control_relay(True)  # Relay ON
+                    time.sleep(10)       # 10 Seconds Wait
+                    control_relay(False) # Relay OFF
+                    print("🔕 TIMER EXPIRED: Relay automatically OFF kiya gaya.")
+                else:
+                    # Agar aapke personal phone se aaya hai ya kisi aur number se, toh relay ON nahi hogi!
+                    print(f"⚠️ IGNORED: Keyword toh sahi hai, par sender ({sender_number}) trusted RDK nahi hai. Loop blocked!")
+            
+            else:
+                # Kisi aur tarah ka normal network network update line ho toh
+                print(f"[SYSTEM LOG] -> {line}")
+
+def main():
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+    except Exception as e:
+        print(f"[!] System Error: Serial connection fail -> {e}")
+        return
+
+    setup_gpio()
+    if not initialize_gsm(ser):
+        ser.close()
+        return
+
+    print("\n--- BOTH-SIDE TRANSCEIVER ACTIVE ---")
+    print("Button press karte hi samne wale RDK ka Relay exact 10 seconds ke liye chalu hoga.\n")
+
+    try:
+        while True:
+            # 1. Incoming serial signal parse karein
+            check_incoming_messages(ser)
+            
+            # 2. Local Button pull-down check karo
+            if read_button():
+                print("\n[EVENT] Hardware Button Pressed! Trigger bhej rahe hain...")
+                send_sms(ser, TARGET_PHONE_NUMBER, "TURN_HORN_ON")
+                
+                while read_button():
+                    time.sleep(0.1)
+                print("[EVENT] Button released. System re-armed.")
+                
+            time.sleep(0.05) 
+            
+    except KeyboardInterrupt:
+        print("\n[-] User ne script roki.")
+    finally:
+        control_relay(False) # Safety state (Sends '1' to keep relay OFF on exit)
+        ser.close()
+
+if __name__ == "__main__":
+    main()
