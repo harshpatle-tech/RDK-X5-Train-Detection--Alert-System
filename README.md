@@ -8,3 +8,9 @@ T1	source /opt/tros/humble/setup.bash	ROS2 source karo
 T1	ros2 launch dnn_node_example dnn_node_example.launch.py	Terminal 1 mein
 T2	source /opt/tros/humble/setup.bash	Naye terminal mein
 T2	python3 ~/train_relay_node.py	Terminal 2 mein
+
+ls /opt/hobot/model/x5/basic/fcos_512x512_nv12.bin
+ls /opt/tros/humble/lib/dnn_node_example/config/fcosworkconfig.json
+source /opt/tros/humble/setup.bash
+export CAM_TYPE=mipi
+ros2 launch dnn_node_example dnn_node_example.launch.py
