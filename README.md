@@ -1,7 +1,7 @@
 # RDK-X5-Train-Detection--Alert-System
 AI-based Train Detection and Communication System using RDK-X5
 
-
+http://192.168.1.25:8000/TogetheROS/
 ROS2 DNN Node + Relay (Terminal 1 aur 2)
 #	Command	Note
 T1	source /opt/tros/humble/setup.bash	ROS2 source karo
